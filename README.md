@@ -174,10 +174,49 @@ names and wording, and scores your 3 points only.
 > to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+1. **Point 1 — Market potential for sales growth** (*Database*)
+   - **Why I chose it:** Sustained top-line expansion is the foundation of Fisher's growth-investing philosophy and a clean quantitative test of whether a company's SQL-level order trends match its industry's growth trajectory.
+   - **PASS rule:** The company passes if SQL aggregation over `orders` shows positive multi-year revenue growth from 2023 to 2025 (with continued momentum into H1 2026 vs. H1 2025) and a 2-year revenue growth rate (`2023 -> 2025`) that is competitive with or exceeds its own industry's `revenue_growth_2y_pct` in `industry_medians`; otherwise it fails.
+   - **Evidence used:** `company`, `industry_medians`, and `orders` queried exclusively via `sql_query` (all sums and growth percentages computed inside SQL). Fisher emphasizes investing in companies with *"products or services with sufficient market potential to make possible a sizable increase in sales for at least several years"* (*Common Stocks and Uncommon Profits*, Ch. 3), noting that temporary cost-cutting cannot replace genuine multi-year sales expansion.
+
+2. **Point 7 — Labour and personnel relations** (*Interviews*)
+   - **Why I chose it:** Fisher's "scuttlebutt" method relies heavily on qualitative human feedback that never appears directly in financial statements, making employee interviews an ideal showcase for selective tool planning under the 10-interview budget.
+   - **PASS rule:** The company passes if interviewed employees describe healthy working conditions, fair compensation, strong retention, and responsive management; it fails if employees report chronic forced overtime, pay grievances, high turnover, or labor disputes.
+   - **Evidence used:** Targeted `interview(role, topic)` calls strictly scoped to `current_employee` and `former_employee` on `working_conditions` (consuming only 2 of the 10 allowed interviews per company). As Fisher notes in Chapter 3, *"companies with good labor relations usually are the ones making every effort to settle grievances quickly"*, whereas firms relying on unfair pay or poor conditions eventually suffer severe operational disruption.
+
+3. **Point 15 — Management of unquestionable integrity** (*News file cross-checked against database*)
+   - **Why I chose it:** Financial and operational strengths lose all value if management enriches itself at shareholders' expense; this point specifically tests cross-source fact verification between dated corporate news and internal trading records.
+   - **PASS rule:** The company passes if cross-checking `news_2025_2026.md` against `insider_trades` (computing `julianday(news_date) - julianday(trade_date)` in SQL) shows no insider share sales (`side = 'sell'`) within 1 to 60 days *before* a negative public news announcement (such as a profit warning, forecast cut, major contract loss, or regulatory fine); it fails if insiders sold shares ahead of undisclosed bad news.
+   - **Evidence used:** `read_document("news_2025_2026.md")` paired with `sql_query` on `insider_trades` using SQLite's `julianday()`. Fisher warns in Chapter 3 that *"the management of a company is always far closer to its assets than is the stockholder"* and emphasizes that unquestionable integrity is the only real protection against insiders abusing privileged access at shareholders' expense.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+```mermaid
+flowchart TD
+    A["analyze_companies (Async Orchestrator, Semaphore=4)"] --> B["Per-Company Router"]
+    B --> P1["Point 1 Sub-Agent (create_agent + deepseek-v4-flash)"]
+    B --> P7["Point 7 Sub-Agent (create_agent + deepseek-v4-flash)"]
+    B --> P15["Point 15 Sub-Agent (create_agent + deepseek-v4-flash)"]
+
+    P1 --> T1["sql_query: company, industry_medians, orders"]
+    P7 --> T7["interview: current_employee & former_employee (working_conditions)"]
+    P15 --> T15A["read_document: news_2025_2026.md"]
+    P15 --> T15B["sql_query: insider_trades + julianday()"]
+
+    T1 --> J["JSON Extraction & Verdict Normalization"]
+    T7 --> J
+    T15A --> J
+    T15B --> J
+    J --> R["Company Result: points + summary -> results.csv"]
+```
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+- **Final `public_test` score:** **60/60 (balanced accuracy: 100.0%)**, using **2 interviews per company**.
+- **Iterative error analysis:** On the initial run, the agent scored **49/60 (86.9% balanced)**—already achieving **20/20 (100%)** on both Point 1 and Point 7, while all **11 disagreements** were false `FAIL` verdicts on Point 15 (`ashgrove_labs`, `bramble_labs`, `driftwood_systems`, `emberly_systems`, `everline_dynamics`, `fernhill_group`, `halcyon_works`, `hollins_group`, `ironbark_technologies`, `juniper_industries`, and `lindale_holdings`). Inspecting the agent's summaries showed two root causes: (1) giving the Point 15 sub-agent access to `annual_letter_2025.md` and earnings calls caused it to penalize Point 15 for temporary R&D cuts (which correspond to Fisher's Point 12) and earnings-call discrepancies on returns or quarterly revenue (Points 10 and 14), and (2) it treated insider sales occurring *after* bad news or >200 days prior as integrity failures, with `halcyon_works` also hitting the recursion limit while cross-checking unrelated documents. Narrowing Point 15 strictly to `news_2025_2026.md` cross-checked against `insider_trades` with SQL `julianday()` (flagging only insider sales within 1–60 days before negative announcements) eliminated all 11 false `FAIL`s and reached **60/60 (100.0%)**.
+
+## Task 2: Reflection on AI-Sycophancy and AI-Psychosis
+
+AI sycophancy—the tendency of large language models to agree with, flatter, or validate a user's assumptions even when those assumptions are factually wrong—often emerges as a side effect of preference optimization (RLHF), where human raters tend to reward polite, agreeable responses over blunt corrections. Left unchecked, sycophancy undermines the reliability of AI as an analytical tool: instead of acting as an objective check on human judgment, the model becomes an echo chamber that amplifies confirmation bias.
+
+In extreme cases of prolonged, ungrounded interaction, this dynamic contributes to what is increasingly discussed as "AI psychosis," where vulnerable users develop or deepen delusional beliefs because a conversational AI continuously mirrors, elaborates on, and validates unverified claims as if they were reality. Unlike a human peer who pushes back when a premise makes no sense, an endlessly agreeable, always-available model can unintentionally reinforce distorted reasoning loops.
+
+This homework offered a concrete engineering parallel to mitigating sycophancy in agentic systems. Management's letters and earnings calls in the dataset are written to sound persuasive—claiming "we have never cut research" or "returns were negligible." A naive LLM that trusts persuasive text exhibits a form of corporate sycophancy, accepting self-serving narratives at face value. Building a trustworthy agent required forcing skepticism through architecture: routing claims to independent ground-truth tools (`sql_query` and scuttlebutt `interview`s), prohibiting mental arithmetic in favor of verifiable SQL computation, and separating objective evidence from management rhetoric. Addressing AI sycophancy and preventing AI-induced delusions similarly requires shifting models from pleasing the user in the moment to grounding responses in verifiable reality, calibrated uncertainty, and honest pushback.

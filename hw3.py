@@ -7,16 +7,21 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
 import threading
 import zlib
 from pathlib import Path
 from typing import Any
 
+from langchain.agents import create_agent
+from langchain_deepseek import ChatDeepSeek
+
 
 MODEL_NAME = "deepseek-v4-flash"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+MAX_CONCURRENT_COMPANIES = 4
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -55,62 +60,213 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+POINT_1_PROMPT = """You are a senior equity analyst evaluating Philip Fisher's Point 1:
+"Does the company have products or services with sufficient market potential to make possible a sizable increase in sales for at least several years?"
+
+Evidence source: SQLite database ONLY (use `sql_query`).
+CRITICAL RULE: Do ALL sums, growth percentages, and comparisons in SQL! Never do arithmetic in your head.
+
+Steps:
+1. Query `company` and `industry_medians` (matching the company's industry) to get `revenue_growth_2y_pct`.
+2. Query `orders` grouped by year (`substr(order_date, 1, 4)`) to get annual revenue (`SUM(amount)`), AND compare H1 2025 (`order_date BETWEEN '2025-01-01' AND '2025-06-30'`) vs H1 2026 (`order_date BETWEEN '2026-01-01' AND '2026-06-30'`).
+   Compute in SQL:
+   - YoY growth 2023->2024 (%)
+   - YoY growth 2024->2025 (%)
+   - 2-year growth 2023->2025 (%) = ROUND((rev_2025 - rev_2023) * 100.0 / rev_2023, 2)
+   - H1 2026 vs H1 2025 growth (%)
+3. Also check product-level revenue trends by year (`GROUP BY product, substr(order_date, 1, 4)`) if helpful to see whether growth is broad/sustainable or decelerating sharply.
+
+Decision Rule for PASS vs FAIL:
+- PASS: The company shows strong, sustained multi-year revenue growth (e.g., positive growth across years AND 2-year growth 2023->2025 clearly competitive with or above the industry median `revenue_growth_2y_pct`, with continued momentum in H1 2026).
+- FAIL: Revenue is flat, shrinking, decelerating into decline, or substantially below the industry median 2-year growth rate.
+
+Return ONLY valid JSON (no markdown fences):
+{"verdict": "PASS" or "FAIL", "reason": "1-2 concise sentences citing exact SQL numbers."}
+"""
+
+POINT_7_PROMPT = """You are a senior equity analyst evaluating Philip Fisher's Point 7:
+"Does the company have outstanding labor and personnel relations?"
+
+Evidence source: `interview` tool ONLY.
+CRITICAL RULE: Only `current_employee` and `former_employee` know about `working_conditions`. Do NOT interview any other role or topic.
+
+Steps:
+1. Call `interview(role="current_employee", topic="working_conditions")`.
+2. Call `interview(role="former_employee", topic="working_conditions")`.
+
+Decision Rule for PASS vs FAIL:
+- PASS: Employees report healthy working conditions, fair pay/treatment, high morale, strong retention, or constructive management-labor relations.
+- FAIL: Employees report poor working conditions, low morale, high turnover, unfair treatment, safety/pay grievances, or labor disputes.
+
+Return ONLY valid JSON (no markdown fences):
+{"verdict": "PASS" or "FAIL", "reason": "1-2 concise sentences citing the interview findings."}
+"""
+
+POINT_15_PROMPT = """You are a senior equity analyst evaluating Philip Fisher's Point 15:
+"Does the company have a management of unquestionable integrity?"
+
+Evidence source: ONLY the news file (`news_2025_2026.md`) cross-checked against `insider_trades` in the SQLite database (`sql_query`).
+CRITICAL RULES:
+- Do NOT read `annual_letter_2025.md` or earnings calls (R&D fluctuations, quarterly revenue reporting differences, or return-rate remarks in earnings calls belong to other Fisher points, NOT Point 15).
+- Do ALL date differences in SQL using `julianday()`, never in your head.
+
+Steps:
+1. Call `read_document(name="news_2025_2026.md")` to read the company's news timeline.
+2. Identify every negative news event in `news_2025_2026.md` and its exact `YYYY-MM-DD` date (e.g., profit warning, sales-forecast cut, loss of major contract, regulatory fine, recall, or investigation).
+3. Call `sql_query` to inspect `insider_trades` AND compute `ROUND(julianday('<news_date>') - julianday(trade_date), 1) AS days_before_news` for all `side = 'sell'` rows against each negative news date.
+
+Decision Rule for PASS vs FAIL:
+- FAIL: Any insider (`side = 'sell'`) sold shares shortly BEFORE a negative news announcement in `news_2025_2026.md` — specifically `0 < days_before_news <= 60` (within 1 to 60 days before the bad news became public), indicating trading on non-public adverse information.
+- PASS: No insider sold shares in the 1-to-60-day window before any negative news event in `news_2025_2026.md`. Note that:
+  * Insider BUYS (`side = 'buy'`) do NOT fail Point 15.
+  * Insider sales AFTER bad news is already public (`days_before_news <= 0`) do NOT fail Point 15.
+  * Insider sales long before (> 90 days before) bad news do NOT fail Point 15.
+  * Having a profit warning, contract loss, or regulatory fine in the news by itself does NOT fail Point 15 unless insiders sold ahead of it.
+
+Return ONLY valid JSON (no markdown fences):
+{"verdict": "PASS" or "FAIL", "reason": "1-2 concise sentences citing exact news dates, insider trade dates, and julianday differences."}
+"""
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    """Parse a JSON object from model output, tolerating code fences or extra text."""
+    cleaned = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1)
+    else:
+        brace_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if brace_match:
+            cleaned = brace_match.group(0)
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        verdict_match = re.search(r"\b(PASS|FAIL)\b", text.upper())
+        return {"verdict": verdict_match.group(1) if verdict_match else None, "reason": text.strip()[:250]}
+
+
+def _parse_verdict(raw: Any) -> str:
+    """Normalize a verdict to 'PASS' or 'FAIL'."""
+    text = str(raw or "").strip().upper()
+    if "FAIL" in text and "PASS" not in text:
+        return "FAIL"
+    if "PASS" in text and "FAIL" not in text:
+        return "PASS"
+    return text if text in VERDICTS else "FAIL"
+
+
+async def _run_point_agent(
+    model: ChatDeepSeek,
+    tools: list[Any],
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str]:
+    """Run one point-specific LangChain agent and return (verdict, reason)."""
+    sub_agent = create_agent(
+        model=model,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
+    result = await sub_agent.ainvoke(
+        {"messages": [{"role": "user", "content": user_prompt}]},
+        config={"recursion_limit": 24},
+    )
+    last_msg = result["messages"][-1]
+    content = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
+    parsed = _extract_json(content)
+    verdict = _parse_verdict(parsed.get("verdict"))
+    reason = str(parsed.get("reason", "")).strip() or content.strip()[:250]
+    return verdict, reason
+
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 7, 15]  ### YOUR CODE HERE
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
-
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
+    """Create and return your model or agent once."""
     ### YOUR CODE HERE
-    return None
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        timeout=60,
+        max_retries=2,
+    )
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
-
-    ``companies`` maps each company folder name to its four LangChain tools:
-
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
-
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
+    """Run your agent and return its verdicts on CHOSEN_POINTS for every company."""
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPANIES)
+    total = len(companies)
+    done_count = 0
+
+    async def analyze_one(company_name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        nonlocal done_count
+        list_documents_tool, read_document_tool, sql_query_tool, interview_tool = tools
+        _ = list_documents_tool
+        async with semaphore:
+            print(f"[START] {company_name}", flush=True)
+            try:
+                p1_task = asyncio.wait_for(
+                    _run_point_agent(
+                        agent,
+                        [sql_query_tool],
+                        POINT_1_PROMPT,
+                        f"Evaluate Point 1 (Market potential for sales growth) for company '{company_name}'.",
+                    ),
+                    timeout=90,
+                )
+                p7_task = asyncio.wait_for(
+                    _run_point_agent(
+                        agent,
+                        [interview_tool],
+                        POINT_7_PROMPT,
+                        f"Evaluate Point 7 (Labor and personnel relations) for company '{company_name}'.",
+                    ),
+                    timeout=90,
+                )
+                p15_task = asyncio.wait_for(
+                    _run_point_agent(
+                        agent,
+                        [read_document_tool, sql_query_tool],
+                        POINT_15_PROMPT,
+                        f"Evaluate Point 15 (Management integrity) for company '{company_name}'.",
+                    ),
+                    timeout=90,
+                )
+
+                results = await asyncio.gather(p1_task, p7_task, p15_task, return_exceptions=True)
+
+                points_out: dict[int, str] = {}
+                summary_parts: list[str] = []
+                for point_num, res in zip(CHOSEN_POINTS, results):
+                    if isinstance(res, Exception):
+                        points_out[point_num] = "FAIL"
+                        summary_parts.append(f"Point {point_num} error: {res}")
+                    else:
+                        verdict, reason = res
+                        points_out[point_num] = verdict
+                        summary_parts.append(f"Point {point_num} ({verdict}): {reason}")
+
+                done_count += 1
+                print(f"[DONE {done_count}/{total}] {company_name} -> {points_out}", flush=True)
+                return company_name, {
+                    "points": points_out,
+                    "summary": " ".join(summary_parts),
+                }
+            except Exception as exc:
+                done_count += 1
+                print(f"[ERROR {done_count}/{total}] {company_name}: {exc}", flush=True)
+                return company_name, {
+                    "points": {p: "FAIL" for p in CHOSEN_POINTS},
+                    "summary": f"Analysis failed due to error: {exc}",
+                }
+
+    completed = await asyncio.gather(*(analyze_one(name, tools) for name, tools in companies.items()))
+    return dict(completed)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
